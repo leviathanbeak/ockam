@@ -13,6 +13,7 @@ use ockam_api::{addr_to_multiaddr, cli_state, route_to_multiaddr};
 use ockam_core::Route;
 use ockam_multiaddr::proto::{DnsAddr, Node, Tcp};
 use ockam_multiaddr::MultiAddr;
+use std::marker::PhantomData;
 use tokio_retry::strategy::FibonacciBackoff;
 use tracing::debug;
 
@@ -46,110 +47,18 @@ async fn run_impl(
     Ok(())
 }
 
-// TODO: This function should be replaced with a better system of
-// printing the node state in the future but for now we can just tell
-// clippy to stop complaining about it.
-#[allow(clippy::too_many_arguments)]
-fn print_node_info(
-    node_port: u16,
-    node_name: &str,
-    status_is_up: bool,
-    default_id: Option<&str>,
-    services: Option<&ServiceList>,
-    tcp_listeners: Option<&TransportList>,
-    secure_channel_listeners: Option<&Vec<String>>,
-    inlets_outlets: Option<(&InletList, &OutletList)>,
-) {
-    println!();
-    println!("Node:");
-    println!("  Name: {}", node_name);
-    println!(
-        "  Status: {}",
-        match status_is_up {
-            true => "UP".light_green(),
-            false => "DOWN".light_red(),
-        }
-    );
-
-    println!("  Route To Node:");
-    let mut m = MultiAddr::default();
-    if m.push_back(Node::new(node_name)).is_ok() {
-        println!("    Short: {}", m);
-    }
-
-    let mut m = MultiAddr::default();
-    if m.push_back(DnsAddr::new("localhost")).is_ok() && m.push_back(Tcp::new(node_port)).is_ok() {
-        println!("    Verbose: {}", m);
-    }
-
-    if let Some(id) = default_id {
-        println!("  Identity: {}", id);
-    }
-
-    if let Some(list) = tcp_listeners {
-        println!("  Transports:");
-        for e in &list.list {
-            println!("    Transport:");
-            println!("      Type: {}", e.tt);
-            println!("      Mode: {}", e.tm);
-            println!("      Address: {}", e.payload);
-        }
-    }
-
-    if let Some(list) = secure_channel_listeners {
-        println!("  Secure Channel Listeners:");
-        for e in list {
-            println!("    Listener:");
-            if let Some(ma) = addr_to_multiaddr(e) {
-                println!("      Address: {}", ma);
-            }
-        }
-    }
-
-    if let Some((inlets, outlets)) = inlets_outlets {
-        println!("  Inlets:");
-        for e in &inlets.list {
-            println!("    Inlet:");
-            println!("      Listen Address: {}", e.bind_addr);
-            if let Some(r) = Route::parse(e.outlet_route.as_ref()) {
-                if let Some(ma) = route_to_multiaddr(&r) {
-                    println!("      Route To Outlet: {}", ma);
-                }
-            }
-        }
-        println!("  Outlets:");
-        for e in &outlets.list {
-            println!("    Outlet:");
-            println!("      Forward Address: {}", e.tcp_addr);
-
-            if let Some(ma) = addr_to_multiaddr(e.worker_addr.as_ref()) {
-                println!("      Address: {}", ma);
-            }
-        }
-    }
-
-    if let Some(list) = services {
-        println!("  Services:");
-        for e in &list.list {
-            println!("    Service:");
-            println!("      Type: {}", e.service_type);
-            if let Some(ma) = addr_to_multiaddr(e.addr.as_ref()) {
-                println!("      Address: {}", ma);
-            }
-        }
-    }
-}
-
 pub async fn print_query_status(
     rpc: &mut Rpc<'_>,
     node_name: &str,
     wait_until_ready: bool,
 ) -> anyhow::Result<()> {
     let cli_state = cli_state::CliState::new()?;
+    let node_state = cli_state.nodes.get(node_name)?;
+    let node_port = node_state.setup()?.default_tcp_listener()?.addr.port();
+    let mut node_info = PrintNodeInfo::init(node_port, node_name);
+
     if !is_node_up(rpc, wait_until_ready).await? {
-        let node_state = cli_state.nodes.get(node_name)?;
-        let node_port = node_state.setup()?.default_tcp_listener()?.addr.port();
-        print_node_info(node_port, node_name, false, None, None, None, None, None);
+        node_info.print()
     } else {
         // Get short id for the node
         rpc.request(api::short_identity()).await?;
@@ -158,20 +67,25 @@ pub async fn print_query_status(
             Err(_) => String::from("None"),
         };
 
+        node_info.default_id = Some(&default_id);
+
         // Get list of services for the node
         let mut rpc = rpc.clone();
         rpc.request(api::list_services()).await?;
         let services = rpc.parse_response::<ServiceList>()?;
+        node_info.services = Some(&services);
 
         // Get list of TCP listeners for node
         let mut rpc = rpc.clone();
         rpc.request(api::list_tcp_listeners()).await?;
         let tcp_listeners = rpc.parse_response::<TransportList>()?;
+        node_info.tcp_listeners = Some(&tcp_listeners);
 
         // Get list of Secure Channel Listeners
         let mut rpc = rpc.clone();
         rpc.request(api::list_secure_channel_listener()).await?;
         let secure_channel_listeners = rpc.parse_response::<Vec<String>>()?;
+        node_info.secure_channel_listeners = Some(&secure_channel_listeners);
 
         // Get list of inlets
         let mut rpc = rpc.clone();
@@ -183,19 +97,17 @@ pub async fn print_query_status(
         rpc.request(api::list_outlets()).await?;
         let outlets = rpc.parse_response::<OutletList>()?;
 
-        let node_state = cli_state.nodes.get(node_name)?;
-        let node_port = node_state.setup()?.default_tcp_listener()?.addr.port();
+        node_info.inlets_outlets = Some((&inlets, &outlets));
 
-        print_node_info(
-            node_port,
-            node_name,
-            true,
-            Some(&default_id),
-            Some(&services),
-            Some(&tcp_listeners),
-            Some(&secure_channel_listeners),
-            Some((&inlets, &outlets)),
-        );
+        node_info.is_default = {
+            if let Ok(default_node) = cli_state.nodes.default() {
+                default_node == node_state
+            } else {
+                false
+            }
+        };
+
+        node_info.print();
     }
 
     Ok(())
@@ -248,3 +160,144 @@ async fn is_node_up(rpc: &mut Rpc<'_>, wait_until_ready: bool) -> anyhow::Result
     }
     Ok(false)
 }
+
+#[derive(Clone, Debug)]
+struct PrintNodeInfo<'a, State = Initialized> {
+    node_port: u16,
+    node_name: &'a str,
+    is_default: bool,
+    status_is_up: bool,
+    default_id: Option<&'a str>,
+    services: Option<&'a ServiceList<'a>>,
+    tcp_listeners: Option<&'a TransportList<'a>>,
+    secure_channel_listeners: Option<&'a Vec<String>>,
+    inlets_outlets: Option<(&'a InletList<'a>, &'a OutletList<'a>)>,
+    phantom_data: PhantomData<State>,
+}
+
+impl<'a> PrintNodeInfo<'a, NotInitialized> {
+    fn init(node_port: u16, node_name: &'a str) -> PrintNodeInfo<Initialized> {
+        PrintNodeInfo::<Initialized> {
+            node_port,
+            node_name,
+            is_default: false,
+            status_is_up: false,
+            default_id: None,
+            services: None,
+            tcp_listeners: None,
+            secure_channel_listeners: None,
+            inlets_outlets: None,
+            phantom_data: PhantomData,
+        }
+    }
+}
+
+impl<'a> PrintNodeInfo<'a, Initialized> {
+    fn print(&self) {
+        let Self {
+            node_name,
+            node_port,
+            is_default,
+            status_is_up,
+            default_id,
+            services,
+            tcp_listeners,
+            secure_channel_listeners,
+            inlets_outlets,
+            ..
+        } = *self;
+
+        let name = if is_default {
+            "{node_name} (default)"
+        } else {
+            node_name
+        };
+
+        println!();
+        println!("Node:");
+        println!("  Name: {}", name);
+        println!(
+            "  Status: {}",
+            match status_is_up {
+                true => "UP".light_green(),
+                false => "DOWN".light_red(),
+            }
+        );
+
+        println!("  Route To Node:");
+        let mut m = MultiAddr::default();
+        if m.push_back(Node::new(node_name)).is_ok() {
+            println!("    Short: {}", m);
+        }
+
+        let mut m = MultiAddr::default();
+        if m.push_back(DnsAddr::new("localhost")).is_ok()
+            && m.push_back(Tcp::new(node_port)).is_ok()
+        {
+            println!("    Verbose: {}", m);
+        }
+
+        if let Some(id) = default_id {
+            println!("  Identity: {}", id);
+        }
+
+        if let Some(list) = tcp_listeners {
+            println!("  Transports:");
+            for e in &list.list {
+                println!("    Transport:");
+                println!("      Type: {}", e.tt);
+                println!("      Mode: {}", e.tm);
+                println!("      Address: {}", e.payload);
+            }
+        }
+
+        if let Some(list) = secure_channel_listeners {
+            println!("  Secure Channel Listeners:");
+            for e in list {
+                println!("    Listener:");
+                if let Some(ma) = addr_to_multiaddr(e) {
+                    println!("      Address: {}", ma);
+                }
+            }
+        }
+
+        if let Some((inlets, outlets)) = inlets_outlets {
+            println!("  Inlets:");
+            for e in &inlets.list {
+                println!("    Inlet:");
+                println!("      Listen Address: {}", e.bind_addr);
+                if let Some(r) = Route::parse(e.outlet_route.as_ref()) {
+                    if let Some(ma) = route_to_multiaddr(&r) {
+                        println!("      Route To Outlet: {}", ma);
+                    }
+                }
+            }
+            println!("  Outlets:");
+            for e in &outlets.list {
+                println!("    Outlet:");
+                println!("      Forward Address: {}", e.tcp_addr);
+
+                if let Some(ma) = addr_to_multiaddr(e.worker_addr.as_ref()) {
+                    println!("      Address: {}", ma);
+                }
+            }
+        }
+
+        if let Some(list) = services {
+            println!("  Services:");
+            for e in &list.list {
+                println!("    Service:");
+                println!("      Type: {}", e.service_type);
+                if let Some(ma) = addr_to_multiaddr(e.addr.as_ref()) {
+                    println!("      Address: {}", ma);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Initialized;
+
+#[derive(Clone, Debug)]
+struct NotInitialized;
